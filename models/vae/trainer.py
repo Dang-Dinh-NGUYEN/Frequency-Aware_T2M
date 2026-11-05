@@ -8,14 +8,11 @@ import datetime
 import numpy as np
 from collections import OrderedDict
 import wandb
+from utils.ddp import reduce_loss
 from utils.eval_t2m import evaluation_vae, test_vae
 from utils.motion_process import recover_from_ric
 from utils.utils import print_current_loss
 import torch.distributed as dist
-
-# Let ops that stay in fp32 (the DCT block, anything autocast keeps in fp32) use TF32 tensor cores.
-torch.backends.cuda.matmul.allow_tf32 = True
-torch.backends.cudnn.allow_tf32 = True
 
 
 def _unwrap(model):
@@ -48,17 +45,13 @@ class VAETrainer:
         self.opt = opt
         self.vae = vae
         self.rank = getattr(opt, 'rank', 0)
-        self.amp = getattr(opt, 'amp', False)
-        print(f"Using mixed precision (bf16) {self.amp}")
-        # No GradScaler: bf16 has the same exponent range as fp32, so loss scaling is unnecessary.
-
+        
         if opt.is_train:
             if opt.recon_loss == "l1":
                 self.recon_criterion = torch.nn.L1Loss()
             elif opt.recon_loss == "l1_smooth":
                 self.recon_criterion = torch.nn.SmoothL1Loss()
 
-            # self.temp_loss = TemporalSmoothnessLoss()
             # ONLY Rank 0 gets the logger
             if self.rank == 0:
                 wandb.init(
@@ -74,8 +67,6 @@ class VAETrainer:
 
             self.logger = None
 
-    def _autocast(self):
-        return torch.amp.autocast('cuda', dtype=torch.bfloat16, enabled=self.amp)
 
     def train_forward(self, batch_data):
         # non_blocking lets the copy overlap with GPU work (needs pin_memory=True in the DataLoader)
@@ -95,12 +86,11 @@ class VAETrainer:
         # loss_temp   = self.temp_loss(pred_motion)
         loss_kl = loss_dict["loss_kl"]
 
-        loss = loss_rec + loss_vel * self.opt.lambda_vel + loss_pos * self.opt.lambda_pos + loss_kl * self.opt.lambda_kl  # + 0.02 * loss_temp
+        loss = loss_rec + loss_vel * self.opt.lambda_vel + loss_pos * self.opt.lambda_pos + loss_kl * self.opt.lambda_kl
 
         loss_dict["loss_recon"] = loss_rec
         loss_dict["loss_vel"] = loss_vel
         loss_dict["loss_pos"] = loss_pos
-        # loss_dict["loss_temp"] = loss_temp
 
         return loss, loss_dict
 
@@ -131,7 +121,6 @@ class VAETrainer:
         self.vae.to(self.opt.device)
         world_size = dist.get_world_size()
 
-        # optimizer (fused=True: one kernel for the whole update instead of many small ones)
         self.optim = torch.optim.AdamW(self.vae.parameters(), lr=self.opt.lr, betas=(0.9, 0.99),
                                        weight_decay=self.opt.weight_decay, fused=True)
         self.scheduler = torch.optim.lr_scheduler.MultiStepLR(self.optim, milestones=self.opt.milestones, gamma=self.opt.gamma)
@@ -176,9 +165,8 @@ class VAETrainer:
                     self.update_lr_warm_up(it, self.opt.warm_up_iter, self.opt.lr)
 
                 # forward / backward
-                self.optim.zero_grad(set_to_none=True)
-                with self._autocast():
-                    loss, loss_dict = self.train_forward(batch_data)
+                self.optim.zero_grad()
+                loss, loss_dict = self.train_forward(batch_data)
                 loss.backward()
                 self.optim.step()
 
@@ -195,7 +183,7 @@ class VAETrainer:
                     data_to_sync = torch.stack([logs[tag] for tag in tags])
 
                     # Sum across all GPUs (this is the only CPU/GPU sync point in the loop)
-                    dist.all_reduce(data_to_sync, op=dist.ReduceOp.SUM)
+                    reduce_loss(data_to_sync)
 
                     if self.rank == 0:
                         values = (data_to_sync / (n_accum * world_size)).tolist()
@@ -229,8 +217,7 @@ class VAETrainer:
 
             with torch.no_grad():
                 for batch_data in val_loader:
-                    with self._autocast():
-                        loss, loss_dict = self.train_forward(batch_data)
+                    loss, loss_dict = self.train_forward(batch_data)
                     _accumulate(val_log, loss, loss_dict)
                     n_val += 1
 
@@ -238,7 +225,7 @@ class VAETrainer:
             val_data = torch.stack([val_log[tag] for tag in val_tags])
 
             # Sum across all GPUs
-            dist.all_reduce(val_data, op=dist.ReduceOp.SUM)
+            reduce_loss(val_data)
 
             if self.rank == 0:
                 values = (val_data / (n_val * world_size)).tolist()

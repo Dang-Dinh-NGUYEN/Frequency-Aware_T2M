@@ -47,10 +47,10 @@ def arg_parse(is_train=False):
     dct_options = parser.add_argument_group('DCT / Frequency Partition Options')
     dct_options.add_argument("--partition_type", type=str, default="linear", choices=["linear", "log"], help="frequency partition type")
     dct_options.add_argument("--decay_type", type=str, default="linear", choices=["linear", "log", "exp"], help="frequency decay type")
-    dct_options.add_argument("--freq_threshold", type=float, default=0.2, help="threshold (default: 0.2)")
+    dct_options.add_argument("--freq_threshold", type=float, default=0.4, help="threshold (default: 0.6)")
     dct_options.add_argument("--learn_threshold", action="store_true", help="learnable threshold")
     dct_options.add_argument("--b", type=float, default=7, help="number of frequency bands")
-    dct_options.add_argument("--threshold_softness", type=float, default=0.05, help="threshold softness")
+    dct_options.add_argument("--threshold_softness", type=float, default=0.02, help="threshold softness")
     dct_options.add_argument("--k", type=float, default=0.05, help="intensity")
 
     # Wavelet Hyperparameters (DWT / SWT)
